@@ -19,12 +19,52 @@ type DrafterAPI struct {
 	router *gin.Engine
 }
 
+type LogManager struct {
+	baseDir  string
+	vmName   string
+	logFiles map[string]*os.File
+}
+
 type VMConfig struct {
 	Name      string `json:"name"`
 	Memory    string `json:"memory"`
 	CPUs      int    `json:"cpus"`
 	DiskSize  string `json:"disk_size"`
 	ImagePath string `json:"image_path"`
+}
+
+func NewLogManager(vmName string) (*LogManager, error) {
+	baseDir := filepath.Join("/home/ec2-user/drafter-api/logs", vmName, time.Now().Format("2006-01-02_15-04-05"))
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create log directory: %v", err)
+	}
+
+	return &LogManager{
+		baseDir:  baseDir,
+		vmName:   vmName,
+		logFiles: make(map[string]*os.File),
+	}, nil
+}
+
+func (lm *LogManager) GetLogger(component string) (*log.Logger, error) {
+	logPath := filepath.Join(lm.baseDir, fmt.Sprintf("%s.log", component))
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open log file: %v", err)
+	}
+
+	lm.logFiles[component] = f
+	return log.New(f, fmt.Sprintf("[%s] ", component), log.LstdFlags|log.Lmsgprefix), nil
+}
+
+func (lm *LogManager) Close() {
+	for _, f := range lm.logFiles {
+		f.Close()
+	}
+}
+
+func (api *DrafterAPI) setupLogging(vmName string) (*LogManager, error) {
+	return NewLogManager(vmName)
 }
 
 func runCommandWithOutput(cmd *exec.Cmd) (string, error) {
@@ -125,6 +165,29 @@ func (api *DrafterAPI) createVM(c *gin.Context) {
 	if err := c.BindJSON(&config); err != nil {
 		log.Printf("Error parsing request: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Add this logging setup right here
+	logManager, err := api.setupLogging(config.Name)
+	if err != nil {
+		log.Printf("Error setting up logging: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to setup logging: %v", err)})
+		return
+	}
+	defer logManager.Close()
+
+	// Get loggers for different components
+	natLogger, err := logManager.GetLogger("nat")
+	if err != nil {
+		log.Printf("Error creating NAT logger: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create NAT logger: %v", err)})
+		return
+	}
+
+	snapshotLogger, err := logManager.GetLogger("snapshotter")
+	if err != nil {
+		log.Printf("Error creating snapshotter logger: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create snapshotter logger: %v", err)})
 		return
 	}
 
@@ -249,10 +312,12 @@ func (api *DrafterAPI) createVM(c *gin.Context) {
 	}
 
 	// Start NAT service
-	log.Printf("Starting NAT service")
+	natLogger.Printf("Starting NAT service")
 	natCmd := exec.Command("sudo", "drafter-nat", "--host-interface", "eth0")
+	natCmd.Stdout = logManager.logFiles["nat"]
+	natCmd.Stderr = logManager.logFiles["nat"]
 	if err := natCmd.Start(); err != nil {
-		log.Printf("Error starting NAT service: %v", err)
+		natLogger.Printf("Error starting NAT service: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to start NAT service: %v", err)})
 		return
 	}
@@ -261,7 +326,7 @@ func (api *DrafterAPI) createVM(c *gin.Context) {
 	time.Sleep(5 * time.Second)
 
 	// Start snapshotter
-	log.Printf("Starting snapshotter")
+	snapshotLogger.Printf("Starting snapshotter")
 	snapshotterCmd := exec.Command("sudo", "drafter-snapshotter", "--netns", fmt.Sprintf("ark-%s", config.Name), "--cpu-template", "T2A", "--memory-size", config.Memory, "--devices", `[
 			{
 					"name": "state",
@@ -296,6 +361,13 @@ func (api *DrafterAPI) createVM(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to start snapshotter: %v", err)})
 		return
 	}
+	snapshotterCmd.Stdout = logManager.logFiles["snapshotter"]
+	snapshotterCmd.Stderr = logManager.logFiles["snapshotter"]
+	if err := snapshotterCmd.Start(); err != nil {
+		snapshotLogger.Printf("Error starting snapshotter: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to start snapshotter: %v", err)})
+		return
+	}
 
 	log.Printf("VM creation initiated successfully: %s", config.Name)
 	c.JSON(http.StatusOK, gin.H{"message": "VM creation initiated", "name": config.Name})
@@ -305,8 +377,24 @@ func (api *DrafterAPI) startVM(c *gin.Context) {
 	name := c.Param("name")
 	log.Printf("Starting VM: %s", name)
 
-	// Start peer service
-	log.Printf("Starting peer service")
+	// Setup logging
+	logManager, err := api.setupLogging(name)
+	if err != nil {
+		log.Printf("Error setting up logging: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to setup logging: %v", err)})
+		return
+	}
+	defer logManager.Close()
+
+	// Set up peer service logging
+	peerLogger, err := logManager.GetLogger("peer")
+	if err != nil {
+		log.Printf("Error creating peer logger: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create peer logger: %v", err)})
+		return
+	}
+
+	peerLogger.Printf("Starting peer service")
 	peerCmd := exec.Command("drafter-peer", "--netns", fmt.Sprintf("ark-%s", name), "--raddr", "", "--laddr", ":1337", "--devices", fmt.Sprintf(`[
 		{
 			"name": "state",
@@ -393,26 +481,45 @@ func (api *DrafterAPI) startVM(c *gin.Context) {
 			"shared": false
 		}
 	]`, name, name, name, name, name, name, name, name, name, name, name, name))
+
+	peerCmd.Stdout = logManager.logFiles["peer"]
+	peerCmd.Stderr = logManager.logFiles["peer"]
+
 	if err := peerCmd.Start(); err != nil {
-		log.Printf("Error starting peer service: %v", err)
+		peerLogger.Printf("Error starting peer service: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start peer service"})
 		return
 	}
 
-	log.Printf("Waiting 5 seconds for peer to initialize")
+	peerLogger.Printf("Waiting 5 seconds for peer to initialize")
 	time.Sleep(5 * time.Second)
 
 	// Start forwarder
-	log.Printf("Starting forwarder")
+	forwarderLogger, err := logManager.GetLogger("forwarder")
+	if err != nil {
+		log.Printf("Error creating forwarder logger: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create forwarder logger: %v", err)})
+		return
+	}
+
+	forwarderLogger.Printf("Starting forwarder")
 	forwarderCmd := exec.Command("drafter-forwarder", "--port-forwards", fmt.Sprintf(`[{"netns":"ark-%s","internalPort":"6379","protocol":"tcp","externalAddr":"127.0.0.1:3333"}]`, name))
+
+	forwarderCmd.Stdout = logManager.logFiles["forwarder"]
+	forwarderCmd.Stderr = logManager.logFiles["forwarder"]
+
 	if err := forwarderCmd.Start(); err != nil {
-		log.Printf("Error starting forwarder: %v", err)
+		forwarderLogger.Printf("Error starting forwarder: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start forwarder"})
 		return
 	}
 
-	log.Printf("VM started successfully: %s", name)
-	c.JSON(http.StatusOK, gin.H{"message": "VM started", "name": name})
+	forwarderLogger.Printf("VM started successfully: %s", name)
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "VM started",
+		"name":      name,
+		"logs_path": logManager.baseDir,
+	})
 }
 
 func (api *DrafterAPI) stopVM(c *gin.Context) {
@@ -463,21 +570,44 @@ func (api *DrafterAPI) migrateVM(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// Setup logging
+	logManager, err := api.setupLogging(name)
+	if err != nil {
+		log.Printf("Error setting up logging: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to setup logging: %v", err)})
+		return
+	}
+	defer logManager.Close()
 
-	log.Printf("Starting migration for VM %s from source IP %s", name, config.SourceIP)
+	// Set up peer service logging
+	peerLogger, err := logManager.GetLogger("peer")
+	if err != nil {
+		log.Printf("Error creating peer logger: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create peer logger: %v", err)})
+		return
+	}
+	// Add logging setup
+	logManager, err := api.setupLogging(name + "-migration")
+	if err != nil {
+		log.Printf("Error setting up logging: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to setup logging: %v", err)})
+		return
+	}
+	defer logManager.Close()
+
+	peerLogger.Printf("Starting migration for VM %s from source IP %s", name, config.SourceIP)
 
 	// Create instance directory
-	cmd := exec.Command("mkdir", "-p", fmt.Sprintf("out/instance-%s/overlay", name), fmt.Sprintf("out/instance-%s/state", name))
+	cmd := exec.Command("sudo", "mkdir", "-p", fmt.Sprintf("/home/ec2-user/out/instance-%s/overlay", name), fmt.Sprintf("/home/ec2-user/out/instance-%s/state", name))
 	if out, err := runCommandWithOutput(cmd); err != nil {
-		log.Printf("Error creating instance directories: %v", err)
+		peerLogger.Printf("Error creating instance directories: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create instance directories: %v", err)})
 		return
 	} else {
-		log.Printf("Created instance directories: %s", out)
+		peerLogger.Printf("Created instance directories: %s", out)
 	}
-
 	// Start peer service for migration
-	log.Printf("Starting peer service for migration")
+	peerLogger.Printf("Starting peer service for migration")
 	peerCmd := exec.Command("drafter-peer", "--netns", fmt.Sprintf("ark-%s", name), "--raddr", fmt.Sprintf("%s:1337", config.SourceIP), "--laddr", "", "--devices", fmt.Sprintf(`[
 		{
 			"name": "state",
@@ -564,25 +694,42 @@ func (api *DrafterAPI) migrateVM(c *gin.Context) {
 			"shared": false
 		}
 	]`, name, name, name, name, name, name, name, name, name, name, name, name))
+
+	// Set up logging before starting the command
+	peerCmd.Stdout = logManager.logFiles["peer"]
+	peerCmd.Stderr = logManager.logFiles["peer"]
 	if err := peerCmd.Start(); err != nil {
-		log.Printf("Error starting peer service: %v", err)
+		peerLogger.Printf("Error starting peer service: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start peer service"})
 		return
 	}
 
-	log.Printf("Waiting 5 seconds for peer to initialize")
+	peerLogger.Printf("Waiting 5 seconds for peer to initialize")
 	time.Sleep(5 * time.Second)
 
+	// Set up forwarder logging
+	forwarderLogger, err := logManager.GetLogger("forwarder")
+	if err != nil {
+		log.Printf("Error creating forwarder logger: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create forwarder logger: %v", err)})
+		return
+	}
+
 	// Start forwarder
-	log.Printf("Starting forwarder")
+	forwarderLogger.Printf("Starting forwarder")
 	forwarderCmd := exec.Command("drafter-forwarder", "--port-forwards", fmt.Sprintf(`[{"netns":"ark-%s","internalPort":"6379","protocol":"tcp","externalAddr":"127.0.0.1:3334"}]`, name))
+
+	// Set up logging before starting the command
+	forwarderCmd.Stdout = logManager.logFiles["forwarder"]
+	forwarderCmd.Stderr = logManager.logFiles["forwarder"]
+
 	if err := forwarderCmd.Start(); err != nil {
-		log.Printf("Error starting forwarder: %v", err)
+		forwarderLogger.Printf("Error starting forwarder: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start forwarder"})
 		return
 	}
 
-	log.Printf("Migration initiated for VM: %s", name)
+	forwarderLogger.Printf("Migration initiated for VM: %s", name)
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Migration initiated",
 		"name":    name,
