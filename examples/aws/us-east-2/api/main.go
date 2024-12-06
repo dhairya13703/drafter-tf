@@ -586,14 +586,6 @@ func (api *DrafterAPI) migrateVM(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create peer logger: %v", err)})
 		return
 	}
-	// Add logging setup
-	logManager, err := api.setupLogging(name + "-migration")
-	if err != nil {
-		log.Printf("Error setting up logging: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to setup logging: %v", err)})
-		return
-	}
-	defer logManager.Close()
 
 	peerLogger.Printf("Starting migration for VM %s from source IP %s", name, config.SourceIP)
 
