@@ -205,7 +205,7 @@ func (api *DrafterAPI) createVM(c *gin.Context) {
 	baseOutDir := "/home/ec2-user/out"
 	blueprintDir := filepath.Join(baseOutDir, "blueprint")
 	packageDir := filepath.Join(baseOutDir, "package")
-	instanceDir := filepath.Join(baseOutDir, fmt.Sprintf("instance-%s", config.Name))
+	instanceDir := filepath.Join(baseOutDir, fmt.Sprintf("instance-0", config.Name))
 	overlayDir := filepath.Join(instanceDir, "overlay")
 	stateDir := filepath.Join(instanceDir, "state")
 
@@ -606,6 +606,7 @@ func (api *DrafterAPI) migrateVM(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
 	// Setup logging
 	logManager, err := api.setupLogging(name)
 	if err != nil {
@@ -626,7 +627,9 @@ func (api *DrafterAPI) migrateVM(c *gin.Context) {
 	peerLogger.Printf("Starting migration for VM %s from source IP %s", name, config.SourceIP)
 
 	// Create instance directory
-	cmd := exec.Command("sudo", "mkdir", "-p", fmt.Sprintf("/home/ec2-user/out/instance-%s/overlay", name), fmt.Sprintf("/home/ec2-user/out/instance-%s/state", name))
+	cmd := exec.Command("sudo", "mkdir", "-p",
+		"/home/ec2-user/out/instance-0/overlay",
+		"/home/ec2-user/out/instance-0/state")
 	if out, err := runCommandWithOutput(cmd); err != nil {
 		peerLogger.Printf("Error creating instance directories: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create instance directories: %v", err)})
@@ -634,98 +637,100 @@ func (api *DrafterAPI) migrateVM(c *gin.Context) {
 	} else {
 		peerLogger.Printf("Created instance directories: %s", out)
 	}
+
 	// Start peer service for migration
 	peerLogger.Printf("Starting peer service for migration")
-	peerCmd := exec.Command("drafter-peer", "--netns", fmt.Sprintf("ark-%s", name), "--raddr", fmt.Sprintf("%s:1337", config.SourceIP), "--laddr", "", "--devices", fmt.Sprintf(`[
-		{
-			"name": "state",
-			"base": "out/package/state.bin",
-			"overlay": "out/instance-%s/overlay/state.bin",
-			"state": "out/instance-%s/state/state.bin",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "memory",
-			"base": "out/package/memory.bin",
-			"overlay": "out/instance-%s/overlay/memory.bin",
-			"state": "out/instance-%s/state/memory.bin",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "kernel",
-			"base": "out/package/vmlinux",
-			"overlay": "out/instance-%s/overlay/vmlinux",
-			"state": "out/instance-%s/state/vmlinux",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "disk",
-			"base": "out/package/rootfs.ext4",
-			"overlay": "out/instance-%s/overlay/rootfs.ext4",
-			"state": "out/instance-%s/state/rootfs.ext4",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "config",
-			"base": "out/package/config.json",
-			"overlay": "out/instance-%s/overlay/config.json",
-			"state": "out/instance-%s/state/config.json",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "oci",
-			"base": "out/package/oci.ext4",
-			"overlay": "out/instance-%s/overlay/oci.ext4",
-			"state": "out/instance-%s/state/oci.ext4",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		}
-	]`, name, name, name, name, name, name, name, name, name, name, name, name))
+	peerCmd := exec.Command("sudo", "drafter-peer", "--netns", "ark0", "--raddr", fmt.Sprintf("%s:1337", config.SourceIP), "--laddr", "", "--devices", `[
+			{
+					"name": "state",
+					"base": "/home/ec2-user/out/package/state.bin",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/state.bin",
+					"state": "/home/ec2-user/out/instance-0/state/state.bin",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "memory",
+					"base": "/home/ec2-user/out/package/memory.bin",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/memory.bin",
+					"state": "/home/ec2-user/out/instance-0/state/memory.bin",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "kernel",
+					"base": "/home/ec2-user/out/package/vmlinux",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/vmlinux",
+					"state": "/home/ec2-user/out/instance-0/state/vmlinux",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "disk",
+					"base": "/home/ec2-user/out/package/rootfs.ext4",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/rootfs.ext4",
+					"state": "/home/ec2-user/out/instance-0/state/rootfs.ext4",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "config",
+					"base": "/home/ec2-user/out/package/config.json",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/config.json",
+					"state": "/home/ec2-user/out/instance-0/state/config.json",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "oci",
+					"base": "/home/ec2-user/out/package/oci.ext4",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/oci.ext4",
+					"state": "/home/ec2-user/out/instance-0/state/oci.ext4",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			}
+	]`)
 
 	// Set up logging before starting the command
 	peerCmd.Stdout = logManager.logFiles["peer"]
 	peerCmd.Stderr = logManager.logFiles["peer"]
+
 	if err := peerCmd.Start(); err != nil {
 		peerLogger.Printf("Error starting peer service: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start peer service"})
@@ -745,7 +750,8 @@ func (api *DrafterAPI) migrateVM(c *gin.Context) {
 
 	// Start forwarder
 	forwarderLogger.Printf("Starting forwarder")
-	forwarderCmd := exec.Command("drafter-forwarder", "--port-forwards", fmt.Sprintf(`[{"netns":"ark-%s","internalPort":"6379","protocol":"tcp","externalAddr":"127.0.0.1:3334"}]`, name))
+	forwarderCmd := exec.Command("sudo", "drafter-forwarder", "--port-forwards",
+		`[{"netns":"ark0","internalPort":"6379","protocol":"tcp","externalAddr":"127.0.0.1:3334"}]`)
 
 	// Set up logging before starting the command
 	forwarderCmd.Stdout = logManager.logFiles["forwarder"]
@@ -759,13 +765,13 @@ func (api *DrafterAPI) migrateVM(c *gin.Context) {
 
 	forwarderLogger.Printf("Migration initiated for VM: %s", name)
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Migration initiated",
-		"name":    name,
-		"source":  config.SourceIP,
-		"status":  "migrating",
+		"message":   "Migration initiated",
+		"name":      name,
+		"source":    config.SourceIP,
+		"status":    "migrating",
+		"logs_path": logManager.baseDir,
 	})
 }
-
 func main() {
 	log.Printf("Starting Drafter API server")
 	api := NewDrafterAPI()

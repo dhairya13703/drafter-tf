@@ -115,32 +115,32 @@ sleep 15  # Wait for NAT to initialize
 # Create initial snapshot
 sudo drafter-snapshotter --netns ark0 --cpu-template T2A --devices '[
   {
-    "name": "state",
-    "output": "out/package/state.bin"
-  },
-  {
-    "name": "memory",
-    "output": "out/package/memory.bin"
-  },
-  {
-    "name": "kernel",
-    "input": "out/blueprint/vmlinux",
-    "output": "out/package/vmlinux"
-  },
-  {
-    "name": "disk",
-    "input": "out/blueprint/rootfs.ext4",
-    "output": "out/package/rootfs.ext4"
-  },
-  {
-    "name": "config",
-    "output": "out/package/config.json"
-  },
-  {
-    "name": "oci",
-    "input": "out/blueprint/oci.ext4",
-    "output": "out/package/oci.ext4"
-  }
+            "name": "state",
+            "output": "/home/ec2-user/out/package/state.bin"
+        },
+        {
+            "name": "memory",
+            "output": "/home/ec2-user/out/package/memory.bin"
+        },
+        {
+            "name": "kernel",
+            "input": "/home/ec2-user/out/blueprint/vmlinux",
+            "output": "/home/ec2-user/out/package/vmlinux"
+        },
+        {
+            "name": "disk",
+            "input": "/home/ec2-user/out/blueprint/rootfs.ext4",
+            "output": "/home/ec2-user/out/package/rootfs.ext4"
+        },
+        {
+            "name": "config",
+            "output": "/home/ec2-user/out/package/config.json"
+        },
+        {
+            "name": "oci",
+            "input": "/home/ec2-user/out/blueprint/oci.ext4",
+            "output": "/home/ec2-user/out/package/oci.ext4"
+        }
 ]' &
 sleep 30  # Wait for snapshotter to complete
 

@@ -1,0 +1,196 @@
+#cloud-config
+runcmd:
+  # Initial system setup
+  - dnf update -y
+  - dnf config-manager --add-repo 'https://loopholelabs.github.io/linux-pvm-ci/alma/aws/repodata/linux-pvm-ci.repo'
+  - dnf install -y kernel-6.7.12_pvm_host_alma_aws-1.x86_64 redis golang git iptables
+  - grubby --set-default /boot/vmlinuz-6.7.12-pvm-host-alma-aws
+  - grubby --copy-default --args="pti=off nokaslr lapic=notscdeadline" --update-kernel /boot/vmlinuz-6.7.12-pvm-host-alma-aws
+  - dracut --force --kver 6.7.12-pvm-host-alma-aws
+  
+  # Create installation directory
+  - mkdir -p /tmp/drafter-install
+  - mkdir -p /opt/drafter/out/blueprint /opt/drafter/out/package /opt/drafter/out/instance-0/{overlay,state}
+  - mkdir -p /opt/drafter-api
+  
+  # Download and install Drafter binaries
+  - |
+    for BINARY in drafter-nat drafter-forwarder drafter-snapshotter drafter-packager drafter-runner drafter-registry drafter-mounter drafter-peer drafter-terminator; do
+      curl -L -o "/tmp/drafter-install/${BINARY}" "https://github.com/loopholelabs/drafter/releases/latest/download/${BINARY}.linux-$(uname -m)"
+      install -v "/tmp/drafter-install/${BINARY}" /usr/local/bin
+    done
+  
+  # Download and install Firecracker with PVM support
+  - |
+    for BINARY in firecracker jailer; do
+      curl -L -o "/tmp/drafter-install/${BINARY}" "https://github.com/loopholelabs/firecracker/releases/download/release-main-live-migration-pvm/${BINARY}.linux-$(uname -m)"
+      install -v "/tmp/drafter-install/${BINARY}" /usr/local/bin
+    done
+  
+  # Configure sudo path
+  - echo 'Defaults    secure_path = /sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin' > /etc/sudoers.d/preserve_path
+  
+  # Load NBD module
+  - modprobe nbd nbds_max=4096
+  - echo "nbd" > /etc/modules-load.d/nbd.conf
+  - echo "options nbd nbds_max=4096" > /etc/modprobe.d/nbd.conf
+  
+  # Download and extract DrafterOS
+  - cd /opt/drafter
+  - curl -L -o out/drafteros-oci.tar.zst "https://github.com/loopholelabs/drafter/releases/latest/download/drafteros-oci-$(uname -m)_pvm.tar.zst"
+  - drafter-packager --package-path out/drafteros-oci.tar.zst --extract --devices '[{"name":"kernel","path":"out/blueprint/vmlinux"},{"name":"disk","path":"out/blueprint/rootfs.ext4"}]'
+  
+  # Setup Drafter API
+  - cd /opt/drafter-api
+  - git clone https://github.com/dhairya13703/drafter-api .
+  - go mod tidy
+  - go build -o drafter-api
+  - chmod +x drafter-api
+  
+  # Enable services in correct order
+  - systemctl enable drafter-api.service
+  - systemctl enable drafter-nat.service
+  - systemctl enable drafter-snapshotter.service
+  - systemctl enable drafter-peer.service
+  - systemctl enable drafter-forwarder.service
+  - systemctl enable redis-setup.service
+  
+  # Start services in correct order with delays to ensure proper initialization
+  - systemctl start drafter-nat.service
+  - sleep 15  # Wait for NAT to initialize
+  - systemctl start drafter-snapshotter.service
+  - sleep 30  # Wait for snapshotter to complete
+  - systemctl start drafter-peer.service
+  - sleep 5  # Wait for peer to initialize
+  - systemctl start drafter-forwarder.service
+  - sleep 5  # Wait for forwarder to initialize
+  - systemctl start redis-setup.service
+  - systemctl start drafter-api.service
+  
+  # Clean up
+  - rm -rf /tmp/drafter-install
+  - reboot
+
+write_files:
+  - path: /etc/modprobe.d/kvm-intel-amd-blacklist.conf
+    permissions: "0644"
+    content: |
+      blacklist kvm-intel
+      blacklist kvm-amd
+  
+  - path: /etc/modules-load.d/kvm-pvm.conf
+    permissions: "0644"
+    content: |
+      kvm-pvm
+  
+  - path: /etc/systemd/system/drafter-nat.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Drafter NAT Service
+      After=network.target
+      
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/drafter-nat --host-interface eth0
+      Restart=always
+      
+      [Install]
+      WantedBy=multi-user.target
+  
+  - path: /etc/systemd/system/drafter-snapshotter.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Drafter Snapshotter Service
+      After=drafter-nat.service
+      Requires=drafter-nat.service
+      
+      [Service]
+      Type=simple
+      WorkingDirectory=/opt/drafter
+      ExecStart=/usr/local/bin/drafter-snapshotter --netns ark0 --cpu-template T2A --memory-size 2048 --devices '[{"name":"state","output":"out/package/state.bin"},{"name":"memory","output":"out/package/memory.bin"},{"name":"kernel","input":"out/blueprint/vmlinux","output":"out/package/vmlinux"},{"name":"disk","input":"out/blueprint/rootfs.ext4","output":"out/package/rootfs.ext4"},{"name":"config","output":"out/package/config.json"}]'
+      Restart=always
+      
+      [Install]
+      WantedBy=multi-user.target
+  
+  - path: /etc/systemd/system/drafter-peer.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Drafter Peer Service
+      After=drafter-snapshotter.service
+      Requires=drafter-snapshotter.service
+      
+      [Service]
+      Type=simple
+      WorkingDirectory=/opt/drafter
+      ExecStart=/usr/local/bin/drafter-peer --netns ark0 --raddr '' --laddr ':1337' --devices '[{"name":"state","base":"out/package/state.bin","overlay":"out/instance-0/overlay/state.bin","state":"out/instance-0/state/state.bin","blockSize":65536,"expiry":1000000000,"maxDirtyBlocks":200,"minCycles":5,"maxCycles":20,"cycleThrottle":500000000,"makeMigratable":true,"shared":false},{"name":"memory","base":"out/package/memory.bin","overlay":"out/instance-0/overlay/memory.bin","state":"out/instance-0/state/memory.bin","blockSize":65536,"expiry":1000000000,"maxDirtyBlocks":200,"minCycles":5,"maxCycles":20,"cycleThrottle":500000000,"makeMigratable":true,"shared":false},{"name":"kernel","base":"out/package/vmlinux","overlay":"out/instance-0/overlay/vmlinux","state":"out/instance-0/state/vmlinux","blockSize":65536,"expiry":1000000000,"maxDirtyBlocks":200,"minCycles":5,"maxCycles":20,"cycleThrottle":500000000,"makeMigratable":true,"shared":false},{"name":"disk","base":"out/package/rootfs.ext4","overlay":"out/instance-0/overlay/rootfs.ext4","state":"out/instance-0/state/rootfs.ext4","blockSize":65536,"expiry":1000000000,"maxDirtyBlocks":200,"minCycles":5,"maxCycles":20,"cycleThrottle":500000000,"makeMigratable":true,"shared":false},{"name":"config","base":"out/package/config.json","overlay":"out/instance-0/overlay/config.json","state":"out/instance-0/state/config.json","blockSize":65536,"expiry":1000000000,"maxDirtyBlocks":200,"minCycles":5,"maxCycles":20,"cycleThrottle":500000000,"makeMigratable":true,"shared":false}]'
+      Restart=always
+      
+      [Install]
+      WantedBy=multi-user.target
+  
+  - path: /etc/systemd/system/drafter-forwarder.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Drafter Forwarder Service
+      After=drafter-peer.service
+      Requires=drafter-peer.service
+      
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/drafter-forwarder --port-forwards '[{"netns":"ark0","internalPort":"6379","protocol":"tcp","externalAddr":"127.0.0.1:3333"}]'
+      Restart=always
+      
+      [Install]
+      WantedBy=multi-user.target
+  
+  - path: /opt/drafter/setup-redis.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      sleep 30  # Wait for services to be fully up
+      redis-cli -p 3333 SET message "Hello from Rocky Linux!"
+      redis-cli -p 3333 SET user "rockyuser"
+      redis-cli -p 3333 SET counter 42
+
+  - path: /etc/systemd/system/redis-setup.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Redis Setup Service
+      After=drafter-forwarder.service
+      Requires=drafter-forwarder.service
+      
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/drafter/setup-redis.sh
+      RemainAfterExit=yes
+      
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/drafter-api.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Drafter REST API Service
+      After=network.target drafter-nat.service drafter-snapshotter.service drafter-peer.service drafter-forwarder.service
+      Requires=drafter-nat.service drafter-snapshotter.service drafter-peer.service drafter-forwarder.service
+      
+      [Service]
+      Type=simple
+      ExecStart=/opt/drafter-api/drafter-api
+      WorkingDirectory=/opt/drafter-api
+      Restart=always
+      User=root
+      
+      [Install]
+      WantedBy=multi-user.target
+
+power_state:
+  mode: reboot
+  condition: True
