@@ -68,14 +68,24 @@ func (api *DrafterAPI) setupLogging(vmName string) (*LogManager, error) {
 }
 
 func runCommandWithOutput(cmd *exec.Cmd) (string, error) {
+	// Create a buffer to capture both stdout and stderr
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = io.MultiWriter(&stdout, os.Stdout) // Write to both buffer and terminal
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr) // Write to both buffer and terminal
+
+	log.Printf("Executing command: %s %v", cmd.Path, cmd.Args)
 	err := cmd.Run()
 	if err != nil {
 		return "", fmt.Errorf("error: %v, stderr: %s", err, stderr.String())
 	}
-	return stdout.String(), nil
+
+	// Log the output
+	output := stdout.String()
+	if output != "" {
+		log.Printf("Command output: %s", output)
+	}
+
+	return output, nil
 }
 
 func NewDrafterAPI() *DrafterAPI {
@@ -275,7 +285,7 @@ func (api *DrafterAPI) createVM(c *gin.Context) {
 	}
 
 	// Extract DrafterOS blueprint
-	log.Printf("Extracting DrafterOS blueprint")
+	log.Printf("Extracting DrafterOS blueprint from %s", drafterosPath)
 	extractDevices := fmt.Sprintf(`[{"name":"kernel","path":"%s"},{"name":"disk","path":"%s"}]`,
 		filepath.Join(blueprintDir, "vmlinux"),
 		filepath.Join(blueprintDir, "rootfs.ext4"))
@@ -285,19 +295,21 @@ func (api *DrafterAPI) createVM(c *gin.Context) {
 		"--extract",
 		"--devices", extractDevices)
 
+	log.Printf("Running extraction command with devices: %s", extractDevices)
 	if out, err := runCommandWithOutput(extractCmd); err != nil {
 		log.Printf("Error extracting DrafterOS: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to extract DrafterOS: %v", err)})
 		return
 	} else {
-		log.Printf("Extracted DrafterOS: %s", out)
+		log.Printf("DrafterOS extraction output: %s", out)
 	}
 
 	// Extract Valkey OCI
-	log.Printf("Extracting Valkey OCI")
+	log.Printf("Extracting Valkey OCI from %s", valkeyPath)
 	extractValkeyDevices := fmt.Sprintf(`[{"name":"oci","path":"%s"}]`,
 		filepath.Join(blueprintDir, "oci.ext4"))
 
+	log.Printf("Running Valkey extraction command with devices: %s", extractValkeyDevices)
 	extractValkeyCmd := exec.Command("sudo", "drafter-packager",
 		"--package-path", valkeyPath,
 		"--extract",
@@ -308,7 +320,26 @@ func (api *DrafterAPI) createVM(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to extract Valkey OCI: %v", err)})
 		return
 	} else {
-		log.Printf("Extracted Valkey OCI: %s", out)
+		log.Printf("Valkey OCI extraction output: %s", out)
+	}
+
+	// Verify extracted files
+	files := []string{
+		filepath.Join(blueprintDir, "vmlinux"),
+		filepath.Join(blueprintDir, "rootfs.ext4"),
+		filepath.Join(blueprintDir, "oci.ext4"),
+	}
+
+	for _, file := range files {
+		if _, err := os.Stat(file); err != nil {
+			log.Printf("Error: extracted file %s not found: %v", file, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Extracted file %s missing", file)})
+			return
+		}
+		fileInfo, err := os.Stat(file)
+		if err == nil {
+			log.Printf("Extracted file %s size: %d bytes", file, fileInfo.Size())
+		}
 	}
 
 	// Start NAT service
@@ -327,40 +358,40 @@ func (api *DrafterAPI) createVM(c *gin.Context) {
 
 	// Start snapshotter
 	snapshotLogger.Printf("Starting snapshotter")
-	snapshotterCmd := exec.Command("sudo", "drafter-snapshotter", "--netns", fmt.Sprintf("ark-%s", config.Name), "--cpu-template", "T2A", "--memory-size", config.Memory, "--devices", `[
-			{
-					"name": "state",
-					"output": "out/package/state.bin"
-			},
-			{
-					"name": "memory",
-					"output": "out/package/memory.bin"
-			},
-			{
-					"name": "kernel",
-					"input": "out/blueprint/vmlinux",
-					"output": "out/package/vmlinux"
-			},
-			{
-					"name": "disk",
-					"input": "out/blueprint/rootfs.ext4",
-					"output": "out/package/rootfs.ext4"
-			},
-			{
-					"name": "config",
-					"output": "out/package/config.json"
-			},
-			{
-					"name": "oci",
-					"input": "out/blueprint/oci.ext4",
-					"output": "out/package/oci.ext4"
-			}
-	]`)
-	if err := snapshotterCmd.Start(); err != nil {
-		log.Printf("Error starting snapshotter: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to start snapshotter: %v", err)})
-		return
-	}
+	snapshotterCmd := exec.Command("sudo", "drafter-snapshotter",
+		"--netns", "ark0",
+		"--cpu-template", "T2A",
+		"--memory-size", config.Memory,
+		"--devices", fmt.Sprintf(`[
+        {
+            "name": "state",
+            "output": "/home/ec2-user/out/package/state.bin"
+        },
+        {
+            "name": "memory",
+            "output": "/home/ec2-user/out/package/memory.bin"
+        },
+        {
+            "name": "kernel",
+            "input": "/home/ec2-user/out/blueprint/vmlinux",
+            "output": "/home/ec2-user/out/package/vmlinux"
+        },
+        {
+            "name": "disk",
+            "input": "/home/ec2-user/out/blueprint/rootfs.ext4",
+            "output": "/home/ec2-user/out/package/rootfs.ext4"
+        },
+        {
+            "name": "config",
+            "output": "/home/ec2-user/out/package/config.json"
+        },
+        {
+            "name": "oci",
+            "input": "/home/ec2-user/out/blueprint/oci.ext4",
+            "output": "/home/ec2-user/out/package/oci.ext4"
+        }
+    ]`))
+	println(snapshotterCmd.String())
 	snapshotterCmd.Stdout = logManager.logFiles["snapshotter"]
 	snapshotterCmd.Stderr = logManager.logFiles["snapshotter"]
 	if err := snapshotterCmd.Start(); err != nil {
@@ -395,93 +426,98 @@ func (api *DrafterAPI) startVM(c *gin.Context) {
 	}
 
 	peerLogger.Printf("Starting peer service")
-	peerCmd := exec.Command("drafter-peer", "--netns", fmt.Sprintf("ark-%s", name), "--raddr", "", "--laddr", ":1337", "--devices", fmt.Sprintf(`[
-		{
-			"name": "state",
-			"base": "out/package/state.bin",
-			"overlay": "out/instance-%s/overlay/state.bin",
-			"state": "out/instance-%s/state/state.bin",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "memory",
-			"base": "out/package/memory.bin",
-			"overlay": "out/instance-%s/overlay/memory.bin",
-			"state": "out/instance-%s/state/memory.bin",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "kernel",
-			"base": "out/package/vmlinux",
-			"overlay": "out/instance-%s/overlay/vmlinux",
-			"state": "out/instance-%s/state/vmlinux",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "disk",
-			"base": "out/package/rootfs.ext4",
-			"overlay": "out/instance-%s/overlay/rootfs.ext4",
-			"state": "out/instance-%s/state/rootfs.ext4",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "config",
-			"base": "out/package/config.json",
-			"overlay": "out/instance-%s/overlay/config.json",
-			"state": "out/instance-%s/state/config.json",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		},
-		{
-			"name": "oci",
-			"base": "out/package/oci.ext4",
-			"overlay": "out/instance-%s/overlay/oci.ext4",
-			"state": "out/instance-%s/state/oci.ext4",
-			"blockSize": 65536,
-			"expiry": 1000000000,
-			"maxDirtyBlocks": 200,
-			"minCycles": 5,
-			"maxCycles": 20,
-			"cycleThrottle": 500000000,
-			"makeMigratable": true,
-			"shared": false
-		}
-	]`, name, name, name, name, name, name, name, name, name, name, name, name))
+	peerCmd := exec.Command("sudo", "drafter-peer",
+		"--netns", "ark0",
+		"--raddr", "",
+		"--laddr", ":1337",
+		"--devices", fmt.Sprintf(`[
+			{
+					"name": "state",
+					"base": "/home/ec2-user/out/package/state.bin",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/state.bin",
+					"state": "/home/ec2-user/out/instance-0/state/state.bin",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "memory",
+					"base": "/home/ec2-user/out/package/memory.bin",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/memory.bin",
+					"state": "/home/ec2-user/out/instance-0/state/memory.bin",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "kernel",
+					"base": "/home/ec2-user/out/package/vmlinux",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/vmlinux",
+					"state": "/home/ec2-user/out/instance-0/state/vmlinux",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "disk",
+					"base": "/home/ec2-user/out/package/rootfs.ext4",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/rootfs.ext4",
+					"state": "/home/ec2-user/out/instance-0/state/rootfs.ext4",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "config",
+					"base": "/home/ec2-user/out/package/config.json",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/config.json",
+					"state": "/home/ec2-user/out/instance-0/state/config.json",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			},
+			{
+					"name": "oci",
+					"base": "/home/ec2-user/out/package/oci.ext4",
+					"overlay": "/home/ec2-user/out/instance-0/overlay/oci.ext4",
+					"state": "/home/ec2-user/out/instance-0/state/oci.ext4",
+					"blockSize": 65536,
+					"expiry": 1000000000,
+					"maxDirtyBlocks": 200,
+					"minCycles": 5,
+					"maxCycles": 20,
+					"cycleThrottle": 500000000,
+					"makeMigratable": true,
+					"shared": false
+			}
+	]`))
 
+	println(peerCmd.String())
 	peerCmd.Stdout = logManager.logFiles["peer"]
 	peerCmd.Stderr = logManager.logFiles["peer"]
 
@@ -503,7 +539,7 @@ func (api *DrafterAPI) startVM(c *gin.Context) {
 	}
 
 	forwarderLogger.Printf("Starting forwarder")
-	forwarderCmd := exec.Command("drafter-forwarder", "--port-forwards", fmt.Sprintf(`[{"netns":"ark-%s","internalPort":"6379","protocol":"tcp","externalAddr":"127.0.0.1:3333"}]`, name))
+	forwarderCmd := exec.Command("drafter-forwarder", "--port-forwards", fmt.Sprintf(`[{"netns":"ark0","internalPort":"6379","protocol":"tcp","externalAddr":"127.0.0.1:3333"}]`))
 
 	forwarderCmd.Stdout = logManager.logFiles["forwarder"]
 	forwarderCmd.Stderr = logManager.logFiles["forwarder"]
