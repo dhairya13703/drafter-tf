@@ -1,0 +1,600 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+type DrafterAPI struct {
+	router *gin.Engine
+}
+
+type VMConfig struct {
+	Name      string `json:"name"`
+	Memory    string `json:"memory"`
+	CPUs      int    `json:"cpus"`
+	DiskSize  string `json:"disk_size"`
+	ImagePath string `json:"image_path"`
+}
+
+func runCommandWithOutput(cmd *exec.Cmd) (string, error) {
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("error: %v, stderr: %s", err, stderr.String())
+	}
+	return stdout.String(), nil
+}
+
+func NewDrafterAPI() *DrafterAPI {
+	api := &DrafterAPI{
+		router: gin.Default(),
+	}
+	api.setupRoutes()
+	return api
+}
+
+func (api *DrafterAPI) setupRoutes() {
+	api.router.POST("/vm/create", api.createVM)
+	api.router.POST("/vm/start/:name", api.startVM)
+	api.router.POST("/vm/stop/:name", api.stopVM)
+	api.router.GET("/vm/status/:name", api.getVMStatus)
+	api.router.POST("/vm/migrate/:name", api.migrateVM)
+}
+
+func (api *DrafterAPI) downloadAndVerifyFile(url, outputPath string) error {
+	log.Printf("Starting download from: %s", url)
+
+	// Create a custom HTTP client with longer timeout
+	client := &http.Client{
+		Timeout: 5 * time.Minute,
+	}
+
+	// Make HTTP request
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad HTTP response: %s", resp.Status)
+	}
+
+	log.Printf("Response headers: %+v", resp.Header)
+	log.Printf("Content length: %d", resp.ContentLength)
+
+	// Create output file
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %v", err)
+	}
+	defer out.Close()
+
+	// Copy the response body to the file
+	written, err := io.Copy(out, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %v", err)
+	}
+
+	log.Printf("Successfully downloaded %d bytes to %s", written, outputPath)
+
+	// Verify file exists and has content
+	fileInfo, err := os.Stat(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat downloaded file: %v", err)
+	}
+
+	if fileInfo.Size() == 0 {
+		return fmt.Errorf("downloaded file is empty")
+	}
+
+	// Check file content
+	fileContent, err := os.ReadFile(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to read downloaded file: %v", err)
+	}
+
+	log.Printf("File size: %d bytes, First 32 bytes: %x", len(fileContent), fileContent[:min(32, len(fileContent))])
+
+	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (api *DrafterAPI) createVM(c *gin.Context) {
+	var config VMConfig
+	if err := c.BindJSON(&config); err != nil {
+		log.Printf("Error parsing request: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Use /home/ec2-user as the base directory
+	baseOutDir := "/home/ec2-user/out"
+	blueprintDir := filepath.Join(baseOutDir, "blueprint")
+	packageDir := filepath.Join(baseOutDir, "package")
+	instanceDir := filepath.Join(baseOutDir, fmt.Sprintf("instance-%s", config.Name))
+	overlayDir := filepath.Join(instanceDir, "overlay")
+	stateDir := filepath.Join(instanceDir, "state")
+
+	log.Printf("Creating VM: %s", config.Name)
+	log.Printf("Using directories: base=%s, blueprint=%s", baseOutDir, blueprintDir)
+
+	// Clean up existing directories if they exist
+	if err := os.RemoveAll(baseOutDir); err != nil {
+		log.Printf("Error cleaning up existing directories: %v", err)
+	}
+
+	// Create all directories
+	dirs := []string{blueprintDir, packageDir, overlayDir, stateDir}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Printf("Error creating directory %s: %v", dir, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create directory %s: %v", dir, err)})
+			return
+		}
+	}
+
+	// Set proper permissions
+	chownCmd := exec.Command("sudo", "chown", "-R", "ec2-user:ec2-user", baseOutDir)
+	if err := chownCmd.Run(); err != nil {
+		log.Printf("Error setting permissions: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to set permissions: %v", err)})
+		return
+	}
+
+	// Download DrafterOS with explicit version
+	drafterosPath := filepath.Join(baseOutDir, "drafteros-oci.tar.zst")
+	// Use a specific version instead of latest
+	downloadURL := fmt.Sprintf("https://github.com/loopholelabs/drafter/releases/download/v0.5.0/drafteros-oci-x86_64_pvm.tar.zst")
+	fmt.Println(downloadURL)
+	if err := api.downloadAndVerifyFile(downloadURL, drafterosPath); err != nil {
+		log.Printf("Error downloading DrafterOS: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to download DrafterOS: %v", err)})
+		return
+	}
+
+	// Download Valkey OCI with explicit version
+	valkeyPath := filepath.Join(baseOutDir, "oci-valkey.tar.zst")
+	valkeyURL := fmt.Sprintf("https://github.com/loopholelabs/drafter/releases/download/v0.5.0/oci-valkey-x86_64.tar.zst")
+	if err := api.downloadAndVerifyFile(valkeyURL, valkeyPath); err != nil {
+		log.Printf("Error downloading Valkey OCI: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to download Valkey OCI: %v", err)})
+		return
+	}
+
+	// Verify downloaded files
+	log.Printf("Verifying downloaded files...")
+	if _, err := os.Stat(drafterosPath); err != nil {
+		log.Printf("DrafterOS file not found: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "DrafterOS file missing after download"})
+		return
+	}
+	if _, err := os.Stat(valkeyPath); err != nil {
+		log.Printf("Valkey file not found: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Valkey file missing after download"})
+		return
+	}
+
+	// Configure sudo path
+	sudoPathCmd := exec.Command("sudo", "tee", "/etc/sudoers.d/preserve_path")
+	sudoPathCmd.Stdin = strings.NewReader("Defaults    secure_path = /sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin:/usr/local/sbin\n")
+	if err := sudoPathCmd.Run(); err != nil {
+		log.Printf("Error configuring sudo path: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to configure sudo path: %v", err)})
+		return
+	}
+
+	// Load NBD module
+	if err := exec.Command("sudo", "modprobe", "nbd", "nbds_max=4096").Run(); err != nil {
+		log.Printf("Error loading NBD module: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to load NBD module: %v", err)})
+		return
+	}
+
+	// Extract DrafterOS blueprint
+	log.Printf("Extracting DrafterOS blueprint")
+	extractDevices := fmt.Sprintf(`[{"name":"kernel","path":"%s"},{"name":"disk","path":"%s"}]`,
+		filepath.Join(blueprintDir, "vmlinux"),
+		filepath.Join(blueprintDir, "rootfs.ext4"))
+
+	extractCmd := exec.Command("sudo", "drafter-packager",
+		"--package-path", drafterosPath,
+		"--extract",
+		"--devices", extractDevices)
+
+	if out, err := runCommandWithOutput(extractCmd); err != nil {
+		log.Printf("Error extracting DrafterOS: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to extract DrafterOS: %v", err)})
+		return
+	} else {
+		log.Printf("Extracted DrafterOS: %s", out)
+	}
+
+	// Extract Valkey OCI
+	log.Printf("Extracting Valkey OCI")
+	extractValkeyDevices := fmt.Sprintf(`[{"name":"oci","path":"%s"}]`,
+		filepath.Join(blueprintDir, "oci.ext4"))
+
+	extractValkeyCmd := exec.Command("sudo", "drafter-packager",
+		"--package-path", valkeyPath,
+		"--extract",
+		"--devices", extractValkeyDevices)
+
+	if out, err := runCommandWithOutput(extractValkeyCmd); err != nil {
+		log.Printf("Error extracting Valkey OCI: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to extract Valkey OCI: %v", err)})
+		return
+	} else {
+		log.Printf("Extracted Valkey OCI: %s", out)
+	}
+
+	// Start NAT service
+	log.Printf("Starting NAT service")
+	natCmd := exec.Command("sudo", "drafter-nat", "--host-interface", "eth0")
+	if err := natCmd.Start(); err != nil {
+		log.Printf("Error starting NAT service: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to start NAT service: %v", err)})
+		return
+	}
+
+	log.Printf("Waiting 5 seconds for NAT to initialize")
+	time.Sleep(5 * time.Second)
+
+	// Start snapshotter
+	log.Printf("Starting snapshotter")
+	snapshotterCmd := exec.Command("sudo", "drafter-snapshotter", "--netns", fmt.Sprintf("ark-%s", config.Name), "--cpu-template", "T2A", "--memory-size", config.Memory, "--devices", `[
+			{
+					"name": "state",
+					"output": "out/package/state.bin"
+			},
+			{
+					"name": "memory",
+					"output": "out/package/memory.bin"
+			},
+			{
+					"name": "kernel",
+					"input": "out/blueprint/vmlinux",
+					"output": "out/package/vmlinux"
+			},
+			{
+					"name": "disk",
+					"input": "out/blueprint/rootfs.ext4",
+					"output": "out/package/rootfs.ext4"
+			},
+			{
+					"name": "config",
+					"output": "out/package/config.json"
+			},
+			{
+					"name": "oci",
+					"input": "out/blueprint/oci.ext4",
+					"output": "out/package/oci.ext4"
+			}
+	]`)
+	if err := snapshotterCmd.Start(); err != nil {
+		log.Printf("Error starting snapshotter: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to start snapshotter: %v", err)})
+		return
+	}
+
+	log.Printf("VM creation initiated successfully: %s", config.Name)
+	c.JSON(http.StatusOK, gin.H{"message": "VM creation initiated", "name": config.Name})
+}
+
+func (api *DrafterAPI) startVM(c *gin.Context) {
+	name := c.Param("name")
+	log.Printf("Starting VM: %s", name)
+
+	// Start peer service
+	log.Printf("Starting peer service")
+	peerCmd := exec.Command("drafter-peer", "--netns", fmt.Sprintf("ark-%s", name), "--raddr", "", "--laddr", ":1337", "--devices", fmt.Sprintf(`[
+		{
+			"name": "state",
+			"base": "out/package/state.bin",
+			"overlay": "out/instance-%s/overlay/state.bin",
+			"state": "out/instance-%s/state/state.bin",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "memory",
+			"base": "out/package/memory.bin",
+			"overlay": "out/instance-%s/overlay/memory.bin",
+			"state": "out/instance-%s/state/memory.bin",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "kernel",
+			"base": "out/package/vmlinux",
+			"overlay": "out/instance-%s/overlay/vmlinux",
+			"state": "out/instance-%s/state/vmlinux",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "disk",
+			"base": "out/package/rootfs.ext4",
+			"overlay": "out/instance-%s/overlay/rootfs.ext4",
+			"state": "out/instance-%s/state/rootfs.ext4",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "config",
+			"base": "out/package/config.json",
+			"overlay": "out/instance-%s/overlay/config.json",
+			"state": "out/instance-%s/state/config.json",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "oci",
+			"base": "out/package/oci.ext4",
+			"overlay": "out/instance-%s/overlay/oci.ext4",
+			"state": "out/instance-%s/state/oci.ext4",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		}
+	]`, name, name, name, name, name, name, name, name, name, name, name, name))
+	if err := peerCmd.Start(); err != nil {
+		log.Printf("Error starting peer service: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start peer service"})
+		return
+	}
+
+	log.Printf("Waiting 5 seconds for peer to initialize")
+	time.Sleep(5 * time.Second)
+
+	// Start forwarder
+	log.Printf("Starting forwarder")
+	forwarderCmd := exec.Command("drafter-forwarder", "--port-forwards", fmt.Sprintf(`[{"netns":"ark-%s","internalPort":"6379","protocol":"tcp","externalAddr":"127.0.0.1:3333"}]`, name))
+	if err := forwarderCmd.Start(); err != nil {
+		log.Printf("Error starting forwarder: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start forwarder"})
+		return
+	}
+
+	log.Printf("VM started successfully: %s", name)
+	c.JSON(http.StatusOK, gin.H{"message": "VM started", "name": name})
+}
+
+func (api *DrafterAPI) stopVM(c *gin.Context) {
+	name := c.Param("name")
+	log.Printf("Stopping VM: %s", name)
+
+	// Stop all drafter services for this VM
+	cmd := exec.Command("pkill", "-f", fmt.Sprintf("ark-%s", name))
+	if out, err := runCommandWithOutput(cmd); err != nil {
+		log.Printf("Error stopping services: %v", err)
+	} else {
+		log.Printf("Services stopped: %s", out)
+	}
+
+	log.Printf("VM stopped successfully: %s", name)
+	c.JSON(http.StatusOK, gin.H{"message": "VM stopped", "name": name})
+}
+
+func (api *DrafterAPI) getVMStatus(c *gin.Context) {
+	name := c.Param("name")
+	log.Printf("Getting status for VM: %s", name)
+
+	// Check if services are running
+	natRunning := exec.Command("pgrep", "-f", "drafter-nat").Run() == nil
+	peerRunning := exec.Command("pgrep", "-f", fmt.Sprintf("ark-%s.*drafter-peer", name)).Run() == nil
+	forwarderRunning := exec.Command("pgrep", "-f", fmt.Sprintf("ark-%s.*drafter-forwarder", name)).Run() == nil
+
+	status := gin.H{
+		"name": name,
+		"services": gin.H{
+			"nat":       natRunning,
+			"peer":      peerRunning,
+			"forwarder": forwarderRunning,
+		},
+	}
+
+	log.Printf("Status for VM %s: %v", name, status)
+	c.JSON(http.StatusOK, status)
+}
+
+func (api *DrafterAPI) migrateVM(c *gin.Context) {
+	name := c.Param("name")
+	var config struct {
+		SourceIP string `json:"source_ip"`
+	}
+	if err := c.BindJSON(&config); err != nil {
+		log.Printf("Error parsing migration request: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("Starting migration for VM %s from source IP %s", name, config.SourceIP)
+
+	// Create instance directory
+	cmd := exec.Command("mkdir", "-p", fmt.Sprintf("out/instance-%s/overlay", name), fmt.Sprintf("out/instance-%s/state", name))
+	if out, err := runCommandWithOutput(cmd); err != nil {
+		log.Printf("Error creating instance directories: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create instance directories: %v", err)})
+		return
+	} else {
+		log.Printf("Created instance directories: %s", out)
+	}
+
+	// Start peer service for migration
+	log.Printf("Starting peer service for migration")
+	peerCmd := exec.Command("drafter-peer", "--netns", fmt.Sprintf("ark-%s", name), "--raddr", fmt.Sprintf("%s:1337", config.SourceIP), "--laddr", "", "--devices", fmt.Sprintf(`[
+		{
+			"name": "state",
+			"base": "out/package/state.bin",
+			"overlay": "out/instance-%s/overlay/state.bin",
+			"state": "out/instance-%s/state/state.bin",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "memory",
+			"base": "out/package/memory.bin",
+			"overlay": "out/instance-%s/overlay/memory.bin",
+			"state": "out/instance-%s/state/memory.bin",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "kernel",
+			"base": "out/package/vmlinux",
+			"overlay": "out/instance-%s/overlay/vmlinux",
+			"state": "out/instance-%s/state/vmlinux",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "disk",
+			"base": "out/package/rootfs.ext4",
+			"overlay": "out/instance-%s/overlay/rootfs.ext4",
+			"state": "out/instance-%s/state/rootfs.ext4",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "config",
+			"base": "out/package/config.json",
+			"overlay": "out/instance-%s/overlay/config.json",
+			"state": "out/instance-%s/state/config.json",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		},
+		{
+			"name": "oci",
+			"base": "out/package/oci.ext4",
+			"overlay": "out/instance-%s/overlay/oci.ext4",
+			"state": "out/instance-%s/state/oci.ext4",
+			"blockSize": 65536,
+			"expiry": 1000000000,
+			"maxDirtyBlocks": 200,
+			"minCycles": 5,
+			"maxCycles": 20,
+			"cycleThrottle": 500000000,
+			"makeMigratable": true,
+			"shared": false
+		}
+	]`, name, name, name, name, name, name, name, name, name, name, name, name))
+	if err := peerCmd.Start(); err != nil {
+		log.Printf("Error starting peer service: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start peer service"})
+		return
+	}
+
+	log.Printf("Waiting 5 seconds for peer to initialize")
+	time.Sleep(5 * time.Second)
+
+	// Start forwarder
+	log.Printf("Starting forwarder")
+	forwarderCmd := exec.Command("drafter-forwarder", "--port-forwards", fmt.Sprintf(`[{"netns":"ark-%s","internalPort":"6379","protocol":"tcp","externalAddr":"127.0.0.1:3334"}]`, name))
+	if err := forwarderCmd.Start(); err != nil {
+		log.Printf("Error starting forwarder: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start forwarder"})
+		return
+	}
+
+	log.Printf("Migration initiated for VM: %s", name)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Migration initiated",
+		"name":    name,
+		"source":  config.SourceIP,
+		"status":  "migrating",
+	})
+}
+
+func main() {
+	log.Printf("Starting Drafter API server")
+	api := NewDrafterAPI()
+	if err := api.router.Run(":8080"); err != nil {
+		log.Fatal(err)
+	}
+}
